@@ -1,14 +1,16 @@
 from model import Generator
 from model import Discriminator
 from torch.autograd import Variable
+from torch.nn import Sequential
 from torchvision.utils import save_image
+from torchvision.models import resnet50
 import torch
 import torch.nn.functional as F
 import numpy as np
 import os
 import time
 import datetime
-
+import tensorflow as tf
 
 class Solver(object):
     """Solver for training and testing StarGAN."""
@@ -68,6 +70,17 @@ class Solver(object):
         self.build_model()
         if self.use_tensorboard:
             self.build_tensorboard()
+
+	    # Resnet
+        resnet = resnet50(pretrained = True).to(self.device)
+        resnet.eval()
+        for param in resnet.parameters():
+            param.requires_grad = False
+        # Delete the last two layers in ResNet. The shape of the features after this layer
+        # is (2048, 7, 7).
+        resnet_modules = list(resnet.children())[:-2]
+        self.resnet_feature_extractor = Sequential(*resnet_modules)
+
 
     def build_model(self):
         """Create a generator and a discriminator."""
@@ -156,6 +169,10 @@ class Solver(object):
                     hair_color_indices.append(i)
 
         c_trg_list = []
+
+        # Add the original labels.
+        c_trg_list.append(c_org.clone().to(self.device))
+
         for i in range(c_dim):
             if dataset == 'CelebA':
                 c_trg = c_org.clone()
@@ -203,6 +220,12 @@ class Solver(object):
             start_iters = self.resume_iters
             self.restore_model(self.resume_iters)
 
+        # Placeholders for logging
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        summary_array = tf.placeholder(tf.float32)
+        d_grads = tf.summary.histogram(name = 'D/grads', values = tf.convert_to_tensor(summary_array))
+        g_grads = tf.summary.histogram(name = 'G/grads', values = tf.convert_to_tensor(summary_array))
+
         # Start training.
         print('Start training...')
         start_time = time.time()
@@ -240,15 +263,20 @@ class Solver(object):
             #                             2. Train the discriminator                              #
             # =================================================================================== #
 
+            # class_estimates = {}
+
             # Compute loss with real images.
             out_src, out_cls = self.D(x_real)
             d_loss_real = - torch.mean(out_src)
             d_loss_cls = self.classification_loss(out_cls, label_org, self.dataset)
+            # class_estimates['D/real_true_class_probabilities'] = label_org.detach().cpu().numpy()
+            # class_estimates['D/real_estimated_class_probabilities'] = F.softmax(out_cls.detach(), dim = 0).cpu().numpy()
 
             # Compute loss with fake images.
             x_fake = self.G(x_real, c_trg)
             out_src, out_cls = self.D(x_fake.detach())
             d_loss_fake = torch.mean(out_src)
+            # class_estimates['D/fake_estimated_class_probabilities'] = F.softmax(out_cls.detach(), dim = 0).cpu().numpy()
 
             # Compute loss for gradient penalty.
             alpha = torch.rand(x_real.size(0), 1, 1, 1).to(self.device)
@@ -268,6 +296,9 @@ class Solver(object):
             loss['D/loss_fake'] = d_loss_fake.item()
             loss['D/loss_cls'] = d_loss_cls.item()
             loss['D/loss_gp'] = d_loss_gp.item()
+
+            d_loss_gradient_norms = list(map(
+                lambda param: torch.norm(param.grad), self.D.parameters()))
             
             # =================================================================================== #
             #                               3. Train the generator                                #
@@ -279,13 +310,16 @@ class Solver(object):
                 out_src, out_cls = self.D(x_fake)
                 g_loss_fake = - torch.mean(out_src)
                 g_loss_cls = self.classification_loss(out_cls, label_trg, self.dataset)
+                # class_estimates['D/fake_target_class_probabilities'] = label_trg.detach().cpu().numpy()
 
                 # Target-to-original domain.
                 x_reconst = self.G(x_fake, c_org)
-                g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
+                g_loss_rec = torch.mean(torch.abs(self.resnet_features(x_real) - self.resnet_features(x_reconst)))
+                # g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
                 # Backward and optimize.
                 g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
+                # g_loss = g_loss_fake + self.lambda_cls * g_loss_cls
                 self.reset_grad()
                 g_loss.backward()
                 self.g_optimizer.step()
@@ -294,6 +328,9 @@ class Solver(object):
                 loss['G/loss_fake'] = g_loss_fake.item()
                 loss['G/loss_rec'] = g_loss_rec.item()
                 loss['G/loss_cls'] = g_loss_cls.item()
+
+                g_loss_gradient_norms = list(map(
+                    lambda param: torch.norm(param.grad), self.G.parameters()))
 
             # =================================================================================== #
             #                                 4. Miscellaneous                                    #
@@ -308,9 +345,27 @@ class Solver(object):
                     log += ", {}: {:.4f}".format(tag, value)
                 print(log)
 
+                # print('label_org', label_org)
+                # print('label_trg', label_trg)
+
                 if self.use_tensorboard:
                     for tag, value in loss.items():
                         self.logger.scalar_summary(tag, value, i+1)
+
+                    """
+                    session = tf.Session()
+                    for tag, value in class_estimates.items():
+                        self.logger.histogram(tag, session.run(grads, feed_dict = {
+                            grads_per_layer: value
+                        }), i+1)
+
+                    self.logger.histogram(session.run(g_grads, feed_dict = {
+                        summary_array: g_loss_gradient_norms 
+                    }), i+1)
+                    self.logger.histogram(session.run(d_grads, feed_dict = {
+                        summary_array: d_loss_gradient_norms 
+                    }), i+1)
+                    """
 
             # Translate fixed images for debugging.
             if (i+1) % self.sample_step == 0:
@@ -580,3 +635,9 @@ class Solver(object):
                 result_path = os.path.join(self.result_dir, '{}-images.jpg'.format(i+1))
                 save_image(self.denorm(x_concat.data.cpu()), result_path, nrow=1, padding=0)
                 print('Saved real and fake images into {}...'.format(result_path))
+
+    def resnet_features(self, img):
+        return self.resnet_feature_extractor(img)
+
+
+

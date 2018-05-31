@@ -3,6 +3,7 @@ import argparse
 from solver import Solver
 from data_loader import get_loader
 from torch.backends import cudnn
+import tensorflow as tf
 
 
 def str2bool(v):

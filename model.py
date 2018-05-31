@@ -3,27 +3,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+def concat_features(x, c):
+    # Replicate spatially and concatenate domain information.
+    c = c.view(c.size(0), c.size(1), 1, 1)
+    c = c.repeat(1, 1, x.size(2), x.size(3))
+    return torch.cat([x, c], dim=1)
+
+
+class ResidualModule(nn.Module):
+    """General residual module"""
+    def __init__(self, name, module):
+        super(ResidualModule, self).__init__()
+        self.name = name
+        self.main = module
+
+    def forward(self, x):
+        return x + self.main(x)
+        
 
 class ResidualBlock(nn.Module):
     """Residual Block with instance normalization."""
     def __init__(self, dim_in, dim_out):
         super(ResidualBlock, self).__init__()
-        self.main = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True))
+        self.main = ResidualModule(
+            'ResidualBlock',
+            nn.Sequential(
+                nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True)))
 
     def forward(self, x):
-        return x + self.main(x)
+        return self.main(x)
 
-
-class Generator(nn.Module):
-    """Generator network."""
+class ResidualGeneratorEncoder(nn.Module):
     def __init__(self, conv_dim=64, c_dim=5, repeat_num=6):
-        super(Generator, self).__init__()
-
+        super(ResidualGeneratorEncoder, self).__init__()
         layers = []
         layers.append(nn.Conv2d(3+c_dim, conv_dim, kernel_size=7, stride=1, padding=3, bias=False))
         layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
@@ -41,23 +57,59 @@ class Generator(nn.Module):
         for i in range(repeat_num):
             layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
 
-        # Up-sampling layers.
-        for i in range(2):
-            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
-            layers.append(nn.InstanceNorm2d(curr_dim//2, affine=True, track_running_stats=True))
-            layers.append(nn.ReLU(inplace=True))
-            curr_dim = curr_dim // 2
-
-        layers.append(nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False))
-        layers.append(nn.Tanh())
+        self.num_output_filters = curr_dim
         self.main = nn.Sequential(*layers)
 
     def forward(self, x, c):
-        # Replicate spatially and concatenate domain information.
-        c = c.view(c.size(0), c.size(1), 1, 1)
-        c = c.repeat(1, 1, x.size(2), x.size(3))
-        x = torch.cat([x, c], dim=1)
-        return self.main(x)
+        return self.main(concat_features(x, c))
+
+
+class ResidualGeneratorDecoder(nn.Module):
+    def __init__(self, conv_dim=64, c_dim=5, repeat_num=6, num_input_filters=256):
+        super(ResidualGeneratorDecoder, self).__init__()
+        layers = []
+
+        curr_dim = num_input_filters
+
+        # Up-sampling layers.
+        layers.append(nn.ConvTranspose2d(curr_dim + 1, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.InstanceNorm2d(curr_dim//2, affine=True, track_running_stats=True))
+        layers.append(nn.ReLU(inplace=True))
+        curr_dim = curr_dim // 2
+
+        layers.append(nn.ConvTranspose2d(curr_dim, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.InstanceNorm2d(curr_dim//2, affine=True, track_running_stats=True))
+        layers.append(nn.ReLU(inplace=True))
+        curr_dim = curr_dim // 2
+
+        layers.append(nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False))
+        self.main = nn.Sequential(*layers)
+
+    def forward(self, x, c):
+        return self.main(concat_features(x, c))
+
+
+class ResidualGenerator(nn.Module):
+    """Generator network for the residual of the input."""
+    def __init__(self, conv_dim=64, c_dim=5, repeat_num=6):
+        super(ResidualGenerator, self).__init__()
+        self.encoder = ResidualGeneratorEncoder(conv_dim, c_dim, repeat_num)
+        self.decoder = ResidualGeneratorDecoder(conv_dim, c_dim, repeat_num, self.encoder.num_output_filters)
+
+    def forward(self, x, c):
+        return self.decoder(self.encoder(x, c), c)
+
+
+class Generator(nn.Module):
+    def __init__(self, conv_dim=64, c_dim=5, repeat_num=6):
+        super(Generator, self).__init__()
+        self.main = ResidualGenerator(conv_dim, c_dim, repeat_num)
+        self.after = nn.Tanh()
+
+    def forward(self, x, c):
+        return self.after(self.main(x, c))
+        # return self.after(self.main(concat_features(x, c)))
+        # return self.after(x + self.main(concat_features(x, c)))
 
 
 class Discriminator(nn.Module):
