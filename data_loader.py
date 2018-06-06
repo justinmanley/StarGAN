@@ -2,19 +2,11 @@ from torch.utils import data
 from torchvision import transforms as T
 from torchvision.datasets import ImageFolder
 from PIL import Image
+from imageio import imread
 import torch
 import os
 import random
-import numpy as np
-import csv
 
-def get_label_names(filename):
-	with open(filename, 'r') as celeba_csv:
-		celeba_reader = csv.reader(celeba_csv, delimiter=' ')
-		for i, row in enumerate(celeba_reader):
-			if i == 1:
-				return row
-	raise ValueError("Expected %s to have a header row" % filename)
 
 class CelebA(data.Dataset):
     """Dataset class for the CelebA dataset."""
@@ -39,53 +31,29 @@ class CelebA(data.Dataset):
 
     def preprocess(self):
         """Preprocess the CelebA attribute file."""
-        celeba_metadata = np.loadtxt(self.attr_path, skiprows = 2, dtype = str)
-        _, D = celeba_metadata.shape
+        lines = [line.rstrip() for line in open(self.attr_path, 'r')]
+        all_attr_names = lines[1].split()
+        for i, attr_name in enumerate(all_attr_names):
+            self.attr2idx[attr_name] = i
+            self.idx2attr[i] = attr_name
 
-        celeba_image_filenames = celeba_metadata[:, 0]
+        lines = lines[2:]
+        random.seed(1234)
+        random.shuffle(lines)
+        for i, line in enumerate(lines):
+            split = line.split()
+            filename = split[0]
+            values = split[1:]
 
-        # Clipping turns -1 into 0.
-        celeba_labels = np.clip(celeba_metadata[:, 1:D].astype(np.float32), 0, 1)
+            label = []
+            for attr_name in self.selected_attrs:
+                idx = self.attr2idx[attr_name]
+                label.append(values[idx] == '1')
 
-        celeba_label_names = np.array([name for name in get_label_names(self.attr_path) if name])
-
-        selected_labels = [i for i, name in enumerate(celeba_label_names) if name in self.selected_attrs]
-
-        num_labels = celeba_labels.shape[1]
-        inverse_celeba_labels = np.logical_not(celeba_labels)
-
-        # Assume that there is only one selected_attr.
-        selected_attr, selected_attr_idx = self.selected_attrs[0], selected_labels[0]
-
-        matches_selected_attr = np.nonzero(celeba_labels[:,selected_attr_idx])[0]
-        does_not_match_selected_attr_full = np.nonzero(inverse_celeba_labels[:,selected_attr_idx])[0]
-        num_matches_selected_attr = matches_selected_attr.shape[0]
-
-        print('matches_selected_attr.shape', matches_selected_attr.shape)
-        print('does_not_match_selected_attr_full', does_not_match_selected_attr_full.shape)
-        
-        does_not_match_selected_attr = np.random.choice(
-            does_not_match_selected_attr_full, num_matches_selected_attr)
-        
-        selected_test, selected_train = matches_selected_attr[0:1000], matches_selected_attr[1000:num_matches_selected_attr]
-        non_selected_test, non_selected_train = does_not_match_selected_attr[0:1000], does_not_match_selected_attr[1000:num_matches_selected_attr]
-
-        test = np.hstack((selected_test, non_selected_test))
-        train = np.hstack((selected_train, non_selected_train))
-
-        print('test.shape', test.shape)
-        print('train.shape', train.shape)
-        
-        np.random.shuffle(test)
-        np.random.shuffle(train)
-
-        for i in range(test.shape[0]):
-            idx = test[i]
-            self.test_dataset.append([celeba_image_filenames[idx], [celeba_labels[idx, selected_attr_idx]]])
-
-        for i in range(train.shape[0]):
-            idx = train[i]
-            self.train_dataset.append([celeba_image_filenames[idx], [celeba_labels[idx, selected_attr_idx]]])
+            if (i+1) < 2000:
+                self.test_dataset.append([filename, label])
+            else:
+                self.train_dataset.append([filename, label])
 
         print('Finished preprocessing the CelebA dataset...')
 
@@ -95,6 +63,58 @@ class CelebA(data.Dataset):
         filename, label = dataset[index]
         image = Image.open(os.path.join(self.image_dir, filename))
         return self.transform(image), torch.FloatTensor(label)
+
+    def __len__(self):
+        """Return the number of images."""
+        return self.num_images
+
+
+class CartoonSet(data.Dataset):
+    """Dataset class for the CartoonSet dataset."""
+
+    def __init__(self, image_dir, attr_path, transform, mode):
+        """Initialize and preprocess the CelebA dataset."""
+        self.image_dir = image_dir
+        self.attr_path = attr_path
+        self.transform = transform
+        self.mode = mode
+        self.train_dataset = []
+        self.test_dataset = []
+        self.attr2idx = {}
+        self.idx2attr = {}
+        self.preprocess()
+
+        if mode == 'train':
+            self.num_images = len(self.train_dataset)
+        else:
+            self.num_images = len(self.test_dataset)
+
+    def preprocess(self):
+        """Preprocess the CartoonSet attribute file."""
+        lines = [line.rstrip() for line in open(self.attr_path, 'r')]
+        all_attr_names = lines[0].split()
+
+        lines = lines[1:]
+        random.seed(1234)
+        random.shuffle(lines)
+        for i, line in enumerate(lines):
+            split = line.split()
+            filename = split[0]
+            labels = split[1:]
+
+            if (i+1) < 20000:
+                self.test_dataset.append([filename] + labels)
+            else:
+                self.train_dataset.append([filename] + labels)
+
+        print('Finished preprocessing the CartoonSet dataset...')
+
+    def __getitem__(self, index):
+        """Return one image and its corresponding attribute label."""
+        dataset = self.train_dataset if self.mode == 'train' else self.test_dataset
+        filename, labels = dataset[index][0], dataset[index][1:]
+        image = imread(os.path.join(self.image_dir, filename + '.png'))
+        return self.transform(Image.fromarray(image[:,:,0:3])), torch.FloatTensor(list(map(float, labels)))
 
     def __len__(self):
         """Return the number of images."""
@@ -117,6 +137,8 @@ def get_loader(image_dir, attr_path, selected_attrs, crop_size=178, image_size=1
         dataset = CelebA(image_dir, attr_path, selected_attrs, transform, mode)
     elif dataset == 'RaFD':
         dataset = ImageFolder(image_dir, transform)
+    elif dataset == 'CartoonSet':
+        dataset = CartoonSet(image_dir, attr_path, transform, mode)
 
     data_loader = data.DataLoader(dataset=dataset,
                                   batch_size=batch_size,

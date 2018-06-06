@@ -72,7 +72,7 @@ class ResidualGeneratorDecoder(nn.Module):
         curr_dim = num_input_filters
 
         # Up-sampling layers.
-        layers.append(nn.ConvTranspose2d(curr_dim + 1, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.ConvTranspose2d(curr_dim + c_dim, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
         layers.append(nn.InstanceNorm2d(curr_dim//2, affine=True, track_running_stats=True))
         layers.append(nn.ReLU(inplace=True))
         curr_dim = curr_dim // 2
@@ -112,9 +112,14 @@ class Generator(nn.Module):
         # return self.after(x + self.main(concat_features(x, c)))
 
 
+def view_attr_predictions(predictions):
+    return predictions.view(predictions.size(0), predictions.size(1))
+
 class Discriminator(nn.Module):
     """Discriminator network with PatchGAN."""
-    def __init__(self, image_size=128, conv_dim=64, c_dim=5, repeat_num=6):
+    def __init__(self, image_size=128, conv_dim=64, attribute_dims={}, repeat_num=6):
+        self.selected_attrs = ['hair_color']
+
         super(Discriminator, self).__init__()
         layers = []
         layers.append(nn.Conv2d(3, conv_dim, kernel_size=4, stride=2, padding=1))
@@ -128,11 +133,24 @@ class Discriminator(nn.Module):
 
         kernel_size = int(image_size / np.power(2, repeat_num))
         self.main = nn.Sequential(*layers)
+
+        # predictions_dim = sum([attribute_dims[attr] for attr in self.selected_attrs])
+        # self.conv1 = nn.Conv2d(curr_dim + predictions_dim, 1, kernel_size=3, stride=1, padding=1, bias=False)
         self.conv1 = nn.Conv2d(curr_dim, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(curr_dim, c_dim, kernel_size=kernel_size, bias=False)
-        
+
+        self.attributes = attribute_dims.keys()
+        for attr, dim in attribute_dims.items():
+            setattr(self, attr, nn.Conv2d(curr_dim, dim, kernel_size=kernel_size, bias=False))
+            
     def forward(self, x):
         h = self.main(x)
+        out_attrs = {attr: view_attr_predictions(getattr(self, attr)(h)) for attr in self.attributes}
+        """
+        out_src = self.conv1(concat_features(h, torch.cat([
+            prediction for attr, prediction in out_attrs.items()
+            if attr in self.selected_attrs
+        ], dim = 1)))
+        """
         out_src = self.conv1(h)
-        out_cls = self.conv2(h)
-        return out_src, out_cls.view(out_cls.size(0), out_cls.size(1))
+
+        return out_src, out_attrs

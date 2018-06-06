@@ -26,27 +26,32 @@ def main(config):
     # Data loader.
     celeba_loader = None
     rafd_loader = None
+    cartoonset_loader = None
 
     if config.dataset in ['CelebA', 'Both']:
         celeba_loader = get_loader(config.celeba_image_dir, config.attr_path, config.selected_attrs,
                                    config.celeba_crop_size, config.image_size, config.batch_size,
                                    'CelebA', config.mode, config.num_workers)
     if config.dataset in ['RaFD', 'Both']:
-        rafd_loader = get_loader(config.rafd_image_dir, None, None,
+        rafd_loader = get_loader(config.rafd_image_dir, config.attr_path, config.selected_attrs,
                                  config.rafd_crop_size, config.image_size, config.batch_size,
                                  'RaFD', config.mode, config.num_workers)
+    if config.dataset == 'CartoonSet':
+        cartoonset_loader = get_loader(config.cartoonset_image_dir, config.attr_path, None,
+                                       config.cartoonset_crop_size, config.image_size, config.batch_size,
+                                       'CartoonSet', config.mode, config.num_workers)
     
 
     # Solver for training and testing StarGAN.
-    solver = Solver(celeba_loader, rafd_loader, config)
+    solver = Solver(celeba_loader, rafd_loader, cartoonset_loader, config)
 
     if config.mode == 'train':
-        if config.dataset in ['CelebA', 'RaFD']:
+        if config.dataset in ['CelebA', 'RaFD', 'CartoonSet']:
             solver.train()
         elif config.dataset in ['Both']:
             solver.train_multi()
     elif config.mode == 'test':
-        if config.dataset in ['CelebA', 'RaFD']:
+        if config.dataset in ['CelebA', 'RaFD', 'CartoonSet']:
             solver.test()
         elif config.dataset in ['Both']:
             solver.test_multi()
@@ -60,6 +65,7 @@ if __name__ == '__main__':
     parser.add_argument('--c2_dim', type=int, default=8, help='dimension of domain labels (2nd dataset)')
     parser.add_argument('--celeba_crop_size', type=int, default=178, help='crop size for the CelebA dataset')
     parser.add_argument('--rafd_crop_size', type=int, default=256, help='crop size for the RaFD dataset')
+    parser.add_argument('--cartoonset_crop_size', type=int, default=256, help='crop size for the CartoonSet dataset')
     parser.add_argument('--image_size', type=int, default=128, help='image resolution')
     parser.add_argument('--g_conv_dim', type=int, default=64, help='number of conv filters in the first layer of G')
     parser.add_argument('--d_conv_dim', type=int, default=64, help='number of conv filters in the first layer of D')
@@ -68,9 +74,11 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_cls', type=float, default=1, help='weight for domain classification loss')
     parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
     parser.add_argument('--lambda_gp', type=float, default=10, help='weight for gradient penalty')
+    parser.add_argument('--attributes_config_file', type=str, default='attributes_config.json',
+                        help='path to a file configuring the supported attributes and their dimensions')
     
     # Training configuration.
-    parser.add_argument('--dataset', type=str, default='CelebA', choices=['CelebA', 'RaFD', 'Both'])
+    parser.add_argument('--dataset', type=str, default='CelebA', choices=['CelebA', 'RaFD', 'CartoonSet', 'Both'])
     parser.add_argument('--batch_size', type=int, default=16, help='mini-batch size')
     parser.add_argument('--num_iters', type=int, default=200000, help='number of total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
@@ -80,8 +88,10 @@ if __name__ == '__main__':
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
     parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
-    parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for the CelebA dataset',
+    parser.add_argument('--selected_attrs', '--list', nargs='+', help='selected attributes for CelebA',
                         default=['Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Male', 'Young'])
+    parser.add_argument('--cartoonset_selected_attr', type=str, default='')
+    parser.add_argument('--debug_attr_values', nargs='+', help='Values to debug for the selected attr for CartoonSet', default = [])
 
     # Test configuration.
     parser.add_argument('--test_iters', type=int, default=200000, help='test model from this step')
@@ -95,6 +105,7 @@ if __name__ == '__main__':
     parser.add_argument('--celeba_image_dir', type=str, default='data/CelebA_nocrop/images')
     parser.add_argument('--attr_path', type=str, default='data/list_attr_celeba.txt')
     parser.add_argument('--rafd_image_dir', type=str, default='data/RaFD/train')
+    parser.add_argument('--cartoonset_image_dir', type=str, default='/home/justin/cartoonset100k')
     parser.add_argument('--log_dir', type=str, default='stargan/logs')
     parser.add_argument('--model_save_dir', type=str, default='stargan/models')
     parser.add_argument('--sample_dir', type=str, default='stargan/samples')

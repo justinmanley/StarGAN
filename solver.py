@@ -11,16 +11,22 @@ import os
 import time
 import datetime
 import tensorflow as tf
+import json
+import sys
+
+sys.path.append(os.path.expanduser('~/cs231n/neural-time-travel'))
+from cartoonset100k_names import hair_names
 
 class Solver(object):
     """Solver for training and testing StarGAN."""
 
-    def __init__(self, celeba_loader, rafd_loader, config):
+    def __init__(self, celeba_loader, rafd_loader, cartoonset_loader, config):
         """Initialize configurations."""
 
         # Data loader.
         self.celeba_loader = celeba_loader
         self.rafd_loader = rafd_loader
+        self.cartoonset_loader = cartoonset_loader
 
         # Model configurations.
         self.c_dim = config.c_dim
@@ -33,6 +39,8 @@ class Solver(object):
         self.lambda_cls = config.lambda_cls
         self.lambda_rec = config.lambda_rec
         self.lambda_gp = config.lambda_gp
+        with open(config.attributes_config_file, 'r') as attr_dims:
+            self.attr_dims = json.load(attr_dims)
 
         # Training configurations.
         self.dataset = config.dataset
@@ -46,6 +54,15 @@ class Solver(object):
         self.beta2 = config.beta2
         self.resume_iters = config.resume_iters
         self.selected_attrs = config.selected_attrs
+        self.cartoonset_selected_attr = config.cartoonset_selected_attr
+        self.debug_attr_values = config.debug_attr_values
+
+        # Set up attr2idx map
+        self.cartoonset_attr2idx = {}
+        lines = [line.rstrip() for line in open(config.attr_path, 'r')]
+        all_attr_names = lines[0].split()
+        for i, attr_name in enumerate(all_attr_names[1:]):
+            self.cartoonset_attr2idx[attr_name] = i
 
         # Test configurations.
         self.test_iters = config.test_iters
@@ -87,6 +104,11 @@ class Solver(object):
         if self.dataset in ['CelebA', 'RaFD']:
             self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)
             self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num) 
+        elif self.dataset in ['CartoonSet']:
+            generator_attr_dim = self.attr_dims[self.cartoonset_selected_attr]
+            print('CartoonSet: generator_attr_dim', generator_attr_dim)
+            self.G = Generator(self.g_conv_dim, generator_attr_dim, self.g_repeat_num)
+            self.D = Discriminator(self.image_size, self.d_conv_dim, self.attr_dims, self.d_repeat_num) 
         elif self.dataset in ['Both']:
             self.G = Generator(self.g_conv_dim, self.c_dim+self.c2_dim+2, self.g_repeat_num)   # 2 for mask vector.
             self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim+self.c2_dim, self.d_repeat_num)
@@ -159,7 +181,17 @@ class Solver(object):
         out[np.arange(batch_size), labels.long()] = 1
         return out
 
-    def create_labels(self, c_org, c_dim=5, dataset='CelebA', selected_attrs=None):
+    def cartoonset_selected_attr_labels(self, labels):
+        selected_attr_idx = self.cartoonset_attr2idx[self.cartoonset_selected_attr]
+        return labels[:,selected_attr_idx]
+
+    def cartoonset_selected_attr_onehot(self, labels):
+        generator_attr_dim = self.attr_dims[self.cartoonset_selected_attr]
+        return self.label2onehot(
+            self.cartoonset_selected_attr_labels(labels),
+            generator_attr_dim)
+
+    def create_labels(self, c_org, debug_attrs = range(5), dataset='CelebA', selected_attrs=None):
         """Generate target domain labels for debugging and testing."""
         # Get hair color indices.
         if dataset == 'CelebA':
@@ -168,12 +200,18 @@ class Solver(object):
                 if attr_name in ['Black_Hair', 'Blond_Hair', 'Brown_Hair', 'Gray_Hair']:
                     hair_color_indices.append(i)
 
+
         c_trg_list = []
 
         # Add the original labels.
-        c_trg_list.append(c_org.clone().to(self.device))
+        if dataset == 'CelebA':
+            c_trg_list.append(c_org.clone().to(self.device))
+        elif dataset == 'RaFD':
+            c_trg_list.append(self.label2onehot(c_org, c_dim).to(self.device))
+        elif dataset == 'CartoonSet':
+            c_trg_list.append(self.cartoonset_selected_attr_onehot(c_org).to(self.device))
 
-        for i in range(c_dim):
+        for i in debug_attrs:
             if dataset == 'CelebA':
                 c_trg = c_org.clone()
                 if i in hair_color_indices:  # Set one hair color to 1 and the rest to 0.
@@ -185,6 +223,9 @@ class Solver(object):
                     c_trg[:, i] = (c_trg[:, i] == 0)  # Reverse attribute value.
             elif dataset == 'RaFD':
                 c_trg = self.label2onehot(torch.ones(c_org.size(0))*i, c_dim)
+            elif dataset == 'CartoonSet':
+                generator_attr_dim = self.attr_dims[self.cartoonset_selected_attr]
+                c_trg = self.label2onehot(torch.ones(c_org.size(0))*i, generator_attr_dim)
 
             c_trg_list.append(c_trg.to(self.device))
         return c_trg_list
@@ -195,6 +236,8 @@ class Solver(object):
             return F.binary_cross_entropy_with_logits(logit, target, size_average=False) / logit.size(0)
         elif dataset == 'RaFD':
             return F.cross_entropy(logit, target)
+        elif dataset == 'CartoonSet':
+            return F.cross_entropy(logit, target)
 
     def train(self):
         """Train StarGAN within a single dataset."""
@@ -203,12 +246,20 @@ class Solver(object):
             data_loader = self.celeba_loader
         elif self.dataset == 'RaFD':
             data_loader = self.rafd_loader
+        elif self.dataset == 'CartoonSet':
+            data_loader = self.cartoonset_loader
 
         # Fetch fixed inputs for debugging.
         data_iter = iter(data_loader)
         x_fixed, c_org = next(data_iter)
         x_fixed = x_fixed.to(self.device)
-        c_fixed_list = self.create_labels(c_org, self.c_dim, self.dataset, self.selected_attrs)
+        
+        if self.dataset == 'CelebA' or self.dataset == 'RaFD':
+            c_fixed_list = self.create_labels(c_org, range(self.c_dim), self.dataset, self.selected_attrs)
+        elif self.dataset == 'CartoonSet':
+            hair_indices = dict((reversed(item) for item in hair_names.items()))
+            selected_attr_indices = [hair_indices[attr] for attr in self.debug_attr_values]
+            c_fixed_list = self.create_labels(c_org, selected_attr_indices, self.dataset, self.selected_attrs)
 
         # Learning rate cache for decaying.
         g_lr = self.g_lr
@@ -252,12 +303,37 @@ class Solver(object):
             elif self.dataset == 'RaFD':
                 c_org = self.label2onehot(label_org, self.c_dim)
                 c_trg = self.label2onehot(label_trg, self.c_dim)
+            elif self.dataset == 'CartoonSet':
+                c_org = self.cartoonset_selected_attr_onehot(label_org)
+                c_trg = self.cartoonset_selected_attr_onehot(label_trg)
 
             x_real = x_real.to(self.device)           # Input images.
+
             c_org = c_org.to(self.device)             # Original domain labels.
             c_trg = c_trg.to(self.device)             # Target domain labels.
-            label_org = label_org.to(self.device)     # Labels for computing classification loss.
-            label_trg = label_trg.to(self.device)     # Labels for computing classification loss.
+
+            if self.dataset == 'CelebA' or self.dataset == 'RaFD':
+                label_org = label_org.to(self.device)     # Labels for computing classification loss.
+                label_trg = label_trg.to(self.device)     # Labels for computing classification loss.
+            elif self.dataset == 'CartoonSet':
+                # Labels for computing classification loss.
+                label_trg = {
+                    attr: (
+                        label_trg[:,self.cartoonset_attr2idx[attr]]
+                        """
+                        label_trg[:,self.cartoonset_attr2idx[attr]]
+                        if attr == self.cartoonset_selected_attr
+                        else label_org[:,self.cartoonset_attr2idx[attr]]
+                        """
+                    ).long().to(self.device)
+                    for attr in self.attr_dims.keys()
+                }
+                # label_trg = self.cartoonset_selected_attr_labels(label_trg).long().to(self.device)
+                label_org = {
+                    attr: label_org[:,self.cartoonset_attr2idx[attr]].long().to(self.device)
+                    for attr in self.attr_dims.keys()
+                }
+
 
             # =================================================================================== #
             #                             2. Train the discriminator                              #
@@ -266,9 +342,12 @@ class Solver(object):
             # class_estimates = {}
 
             # Compute loss with real images.
-            out_src, out_cls = self.D(x_real)
+            out_src, out_attrs = self.D(x_real)
             d_loss_real = - torch.mean(out_src)
-            d_loss_cls = self.classification_loss(out_cls, label_org, self.dataset)
+            d_loss_attrs = sum([
+                self.classification_loss(out_attrs[attr], label_org[attr], self.dataset)
+                for attr in self.attr_dims.keys()
+            ]) / len(self.attr_dims)
             # class_estimates['D/real_true_class_probabilities'] = label_org.detach().cpu().numpy()
             # class_estimates['D/real_estimated_class_probabilities'] = F.softmax(out_cls.detach(), dim = 0).cpu().numpy()
 
@@ -285,7 +364,7 @@ class Solver(object):
             d_loss_gp = self.gradient_penalty(out_src, x_hat)
 
             # Backward and optimize.
-            d_loss = d_loss_real + d_loss_fake + self.lambda_cls * d_loss_cls + self.lambda_gp * d_loss_gp
+            d_loss = d_loss_real + d_loss_fake + self.lambda_cls * d_loss_attrs + self.lambda_gp * d_loss_gp
             self.reset_grad()
             d_loss.backward()
             self.d_optimizer.step()
@@ -294,7 +373,7 @@ class Solver(object):
             loss = {}
             loss['D/loss_real'] = d_loss_real.item()
             loss['D/loss_fake'] = d_loss_fake.item()
-            loss['D/loss_cls'] = d_loss_cls.item()
+            loss['D/loss_attrs'] = d_loss_attrs.item()
             loss['D/loss_gp'] = d_loss_gp.item()
 
             d_loss_gradient_norms = list(map(
@@ -309,7 +388,16 @@ class Solver(object):
                 x_fake = self.G(x_real, c_trg)
                 out_src, out_cls = self.D(x_fake)
                 g_loss_fake = - torch.mean(out_src)
-                g_loss_cls = self.classification_loss(out_cls, label_trg, self.dataset)
+                """
+                g_loss_attrs = self.classification_loss(
+                    out_cls[self.cartoonset_selected_attr],
+                    label_trg[self.cartoonset_selected_attr],
+                    self.dataset)
+                """
+                g_loss_attrs = sum([
+                    self.classification_loss(out_cls[attr], label_trg[attr], self.dataset)
+                    for attr in self.attr_dims.keys()
+                ]) / len(self.attr_dims)
                 # class_estimates['D/fake_target_class_probabilities'] = label_trg.detach().cpu().numpy()
 
                 # Target-to-original domain.
@@ -318,7 +406,7 @@ class Solver(object):
                 # g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
                 # Backward and optimize.
-                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
+                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_attrs
                 # g_loss = g_loss_fake + self.lambda_cls * g_loss_cls
                 self.reset_grad()
                 g_loss.backward()
@@ -327,7 +415,7 @@ class Solver(object):
                 # Logging.
                 loss['G/loss_fake'] = g_loss_fake.item()
                 loss['G/loss_rec'] = g_loss_rec.item()
-                loss['G/loss_cls'] = g_loss_cls.item()
+                loss['G/loss_cls'] = g_loss_attrs.item()
 
                 g_loss_gradient_norms = list(map(
                     lambda param: torch.norm(param.grad), self.G.parameters()))
@@ -344,9 +432,6 @@ class Solver(object):
                 for tag, value in loss.items():
                     log += ", {}: {:.4f}".format(tag, value)
                 print(log)
-
-                # print('label_org', label_org)
-                # print('label_trg', label_trg)
 
                 if self.use_tensorboard:
                     for tag, value in loss.items():
@@ -402,8 +487,8 @@ class Solver(object):
         # Fetch fixed inputs for debugging.
         x_fixed, c_org = next(celeba_iter)
         x_fixed = x_fixed.to(self.device)
-        c_celeba_list = self.create_labels(c_org, self.c_dim, 'CelebA', self.selected_attrs)
-        c_rafd_list = self.create_labels(c_org, self.c2_dim, 'RaFD')
+        c_celeba_list = self.create_labels(c_org, range(self.c_dim), 'CelebA', self.selected_attrs)
+        c_rafd_list = self.create_labels(c_org, range(self.c2_dim), 'RaFD')
         zero_celeba = torch.zeros(x_fixed.size(0), self.c_dim).to(self.device)           # Zero vector for CelebA.
         zero_rafd = torch.zeros(x_fixed.size(0), self.c2_dim).to(self.device)             # Zero vector for RaFD.
         mask_celeba = self.label2onehot(torch.zeros(x_fixed.size(0)), 2).to(self.device)  # Mask vector: [1, 0].
@@ -591,7 +676,7 @@ class Solver(object):
 
                 # Prepare input images and target domain labels.
                 x_real = x_real.to(self.device)
-                c_trg_list = self.create_labels(c_org, self.c_dim, self.dataset, self.selected_attrs)
+                c_trg_list = self.create_labels(c_org, range(self.c_dim), self.dataset, self.selected_attrs)
 
                 # Translate images.
                 x_fake_list = [x_real]
@@ -614,8 +699,8 @@ class Solver(object):
 
                 # Prepare input images and target domain labels.
                 x_real = x_real.to(self.device)
-                c_celeba_list = self.create_labels(c_org, self.c_dim, 'CelebA', self.selected_attrs)
-                c_rafd_list = self.create_labels(c_org, self.c2_dim, 'RaFD')
+                c_celeba_list = self.create_labels(c_org, range(self.c_dim), 'CelebA', self.selected_attrs)
+                c_rafd_list = self.create_labels(c_org, range(self.c2_dim), 'RaFD')
                 zero_celeba = torch.zeros(x_real.size(0), self.c_dim).to(self.device)            # Zero vector for CelebA.
                 zero_rafd = torch.zeros(x_real.size(0), self.c2_dim).to(self.device)             # Zero vector for RaFD.
                 mask_celeba = self.label2onehot(torch.zeros(x_real.size(0)), 2).to(self.device)  # Mask vector: [1, 0].
