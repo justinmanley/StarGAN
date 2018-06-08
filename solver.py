@@ -230,6 +230,11 @@ class Solver(object):
             c_trg_list.append(c_trg.to(self.device))
         return c_trg_list
 
+    def cartoonset_create_labels(self, c_org):
+        hair_indices = dict((reversed(item) for item in hair_names.items()))
+        selected_attr_indices = [hair_indices[attr] for attr in self.debug_attr_values]
+        return self.create_labels(c_org, selected_attr_indices, self.dataset, self.selected_attrs)
+
     def classification_loss(self, logit, target, dataset='CelebA'):
         """Compute binary or softmax cross entropy loss."""
         if dataset == 'CelebA':
@@ -257,9 +262,7 @@ class Solver(object):
         if self.dataset == 'CelebA' or self.dataset == 'RaFD':
             c_fixed_list = self.create_labels(c_org, range(self.c_dim), self.dataset, self.selected_attrs)
         elif self.dataset == 'CartoonSet':
-            hair_indices = dict((reversed(item) for item in hair_names.items()))
-            selected_attr_indices = [hair_indices[attr] for attr in self.debug_attr_values]
-            c_fixed_list = self.create_labels(c_org, selected_attr_indices, self.dataset, self.selected_attrs)
+            c_fixed_list = self.cartoonset_create_labels(c_org)
 
         # Learning rate cache for decaying.
         g_lr = self.g_lr
@@ -320,11 +323,8 @@ class Solver(object):
                 label_trg = {
                     attr: (
                         label_trg[:,self.cartoonset_attr2idx[attr]]
-                        """
-                        label_trg[:,self.cartoonset_attr2idx[attr]]
                         if attr == self.cartoonset_selected_attr
                         else label_org[:,self.cartoonset_attr2idx[attr]]
-                        """
                     ).long().to(self.device)
                     for attr in self.attr_dims.keys()
                 }
@@ -394,10 +394,15 @@ class Solver(object):
                     label_trg[self.cartoonset_selected_attr],
                     self.dataset)
                 """
-                g_loss_attrs = sum([
+                g_loss_selected_attr = self.classification_loss(
+                    out_cls[self.cartoonset_selected_attr],
+                    label_trg[self.cartoonset_selected_attr],
+                    self.dataset)
+                g_loss_attrs = (sum([
                     self.classification_loss(out_cls[attr], label_trg[attr], self.dataset)
                     for attr in self.attr_dims.keys()
-                ]) / len(self.attr_dims)
+                    if attr != self.cartoonset_selected_attr
+                ]) / (len(self.attr_dims) - 1))
                 # class_estimates['D/fake_target_class_probabilities'] = label_trg.detach().cpu().numpy()
 
                 # Target-to-original domain.
@@ -406,7 +411,7 @@ class Solver(object):
                 # g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
                 # Backward and optimize.
-                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_attrs
+                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_selected_attr
                 # g_loss = g_loss_fake + self.lambda_cls * g_loss_cls
                 self.reset_grad()
                 g_loss.backward()
@@ -670,13 +675,18 @@ class Solver(object):
             data_loader = self.celeba_loader
         elif self.dataset == 'RaFD':
             data_loader = self.rafd_loader
+        elif self.dataset == 'CartoonSet':
+            data_loader = self.cartoonset_loader
         
         with torch.no_grad():
             for i, (x_real, c_org) in enumerate(data_loader):
 
                 # Prepare input images and target domain labels.
                 x_real = x_real.to(self.device)
-                c_trg_list = self.create_labels(c_org, range(self.c_dim), self.dataset, self.selected_attrs)
+                if self.dataset == 'CelebA' or self.dataset == 'RaFD':
+                    c_trg_list = self.create_labels(c_org, range(self.c_dim), self.dataset, self.selected_attrs)
+                elif self.dataset == 'CartoonSet':
+                    c_trg_list = self.cartoonset_create_labels(c_org)
 
                 # Translate images.
                 x_fake_list = [x_real]

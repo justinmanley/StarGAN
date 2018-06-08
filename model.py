@@ -107,7 +107,7 @@ class Generator(nn.Module):
         self.after = nn.Tanh()
 
     def forward(self, x, c):
-        return self.after(self.main(x, c))
+        return self.after(x + self.main(x, c))
         # return self.after(self.main(concat_features(x, c)))
         # return self.after(x + self.main(concat_features(x, c)))
 
